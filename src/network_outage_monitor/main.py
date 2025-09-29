@@ -48,14 +48,21 @@ def read_entries(filepath: str) -> Generator[tuple[int, bool]]:
 def daemon_mode(url: str, interval: int, save_dir: str) -> None:
     os.makedirs(save_dir, exist_ok=True)
     print(f"Starting uptime monitor every {interval}s. Saving to: {save_dir}")
+    previous_state = None
 
     while True:
-        now = int(time.time())
-        status = is_site_up(url)
-        month_str = datetime.fromtimestamp(now).strftime("%Y-%m")
-        filename = os.path.join(save_dir, f"uptime_{month_str}.log")
-        write_entry(filename, now, status)
-        time.sleep(interval)
+        try:
+            now = int(time.time())
+            current_state = is_site_up(url)
+            if current_state is not previous_state:
+                month_str = datetime.fromtimestamp(now).strftime("%Y-%m")
+                filename = os.path.join(save_dir, f"uptime_{month_str}.log")
+                write_entry(filename, now, current_state)
+                previous_state = current_state
+
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            exit(0)
 
 
 def log_mode(load_dir: str) -> None:
@@ -66,7 +73,7 @@ def log_mode(load_dir: str) -> None:
         print("No log files found.")
         return
 
-    print(f"| {'Time':<20} | Status |")
+    print(f"| {'Time':<19} | Status |")
     print(f"|{'-'*21}|--------|")
 
     for filepath in log_files:
