@@ -9,7 +9,7 @@ import requests
 
 def is_site_up(url: str) -> bool:
     try:
-        response = requests.get(url, timeout=5)
+        response = requests.head(url, timeout=5)
         return response.ok
     except requests.RequestException:
         return False
