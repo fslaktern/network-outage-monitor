@@ -4,15 +4,13 @@ import time
 from datetime import datetime
 from typing import Generator
 
-import requests
+from scapy.all import sr, IP, ICMP
 
 
-def is_site_up(url: str) -> bool:
-    try:
-        response = requests.head(url, timeout=5)
-        return response.ok
-    except requests.RequestException:
-        return False
+def is_up(ip: str) -> bool:
+    pkt = IP(dst=ip) / ICMP()
+    ans, unans = sr(pkt, timeout=2, verbose=0)
+    return bool(ans)
 
 
 def write_entry(filepath: str, timestamp: int, status: bool) -> None:
@@ -45,7 +43,7 @@ def read_entries(filepath: str) -> Generator[tuple[int, bool]]:
             yield timestamp, bool(status)
 
 
-def daemon_mode(url: str, interval: int, save_dir: str) -> None:
+def daemon_mode(ip: str, interval: int, save_dir: str) -> None:
     os.makedirs(save_dir, exist_ok=True)
     print(f"Starting uptime monitor every {interval}s. Saving to: {save_dir}")
     previous_state = None
@@ -53,7 +51,7 @@ def daemon_mode(url: str, interval: int, save_dir: str) -> None:
     while True:
         try:
             now = int(time.time())
-            current_state = is_site_up(url)
+            current_state = is_up(ip)
             if current_state is not previous_state:
                 month_str = datetime.fromtimestamp(now).strftime("%Y-%m")
                 filename = os.path.join(save_dir, f"uptime_{month_str}.log")
@@ -95,7 +93,7 @@ def main() -> None:
     daemon_parser.add_argument(
         "--save", type=str, required=True, help="Directory to save logs"
     )
-    daemon_parser.add_argument("--url", type=str, required=True, help="URL to monitor")
+    daemon_parser.add_argument("--ip", type=str, required=True, help="IP to monitor")
 
     # log subcommand
     log_parser = subparsers.add_parser("log", help="Read and print logs")
@@ -106,7 +104,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "daemon":
-        daemon_mode(args.url, args.interval, args.save)
+        daemon_mode(args.ip, args.interval, args.save)
     elif args.command == "log":
         log_mode(args.load)
 
