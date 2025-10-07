@@ -24,7 +24,7 @@ cd network-outage-monitor
 ### Start ping
 
 ``` sh
-sudo uv run network_outage_monitor daemon --ip 1.1.1.1 --save cloudflare --interval 5
+sudo uv run network_outage_monitor daemon --ip 1.1.1.1 --save cloudflare --interval 2
 # Starting uptime monitor every 2s. Saving to directory: cloudflare
 
 # Send updates to a Discord channel
@@ -34,6 +34,7 @@ sudo uv run network_outage_monitor daemon --ip 1.1.1.1 --save cloudflare --inter
 
 # Domains also work, but is less reliable in case of DNS errors
 uv run network_outage_monitor daemon --interval 5 --save ./google --ip google.com --discord-webhook https://discordapp.com/api/webhooks/<channel_id>/<secret>
+# Starting uptime monitor every 5s. Saving to directory: google
 
 # Data is bitpacked, and entries are only stored when uptime state is changed
 # 12 entries * 4 bytes (31 bits + 1 bit) per entry = 48 bytes
