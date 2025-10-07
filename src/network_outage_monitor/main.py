@@ -171,8 +171,6 @@ def daemon_mode(
 
 
 def log_mode(load_dir: str) -> None:
-    from glob import glob
-
     log_files = sorted(glob(os.path.join(load_dir, "uptime_*.log")))
     if not log_files:
         print("No log files found")
