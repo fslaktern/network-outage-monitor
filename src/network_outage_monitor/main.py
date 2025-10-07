@@ -170,20 +170,47 @@ def daemon_mode(
             break
 
 
+
 def log_mode(load_dir: str) -> None:
     log_files = sorted(glob(os.path.join(load_dir, "uptime_*.log")))
     if not log_files:
         print("No log files found")
         return
 
+    entries: list[Entry] = []
+
+    for filepath in log_files:
+        entries.extend(read_entries(filepath))
+
+    if not entries:
+        print("No entries found in log files")
+        return
+
+    entries.sort(key=lambda e: e.timestamp)
+    total_uptime = timedelta()
+    total_downtime = timedelta()
+
+    # Calculate accumulated of uptime and downtime
+    for i in range(1, len(entries)):
+        previous = entries[i - 1]
+        current = entries[i]
+        delta = timedelta(seconds=current.timestamp - previous.timestamp)
+
+        if previous.status:
+            total_uptime += delta
+        else:
+            total_downtime += delta
+
+    print(f"Total uptime: {format_timedelta(total_uptime)}")
+    print(f"Total downtime: {format_timedelta(total_downtime)}\n")
+
     print(f"| {'Time':<19} | Status |")
     print(f"|{'-' * 21}|--------|")
 
-    for filepath in log_files:
-        for timestamp, status in read_entries(filepath):
-            timestr = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-            statstr = "UP" if status else "DOWN"
-            print(f"| {timestr} | {statstr:<6} |")
+    for entry in entries:
+        timestr = datetime.fromtimestamp(entry.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        statstr = "UP" if entry.status else "DOWN"
+        print(f"| {timestr} | {statstr:<6} |")
 
 
 def main() -> None:
