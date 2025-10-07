@@ -41,6 +41,8 @@ ls -lAh cloudflare
 # -rw-r--r-- 1 root root 48 Oct  7 22:57 uptime_2025-10.log
 ```
 
+![Webhook notifications in Discord channel](./media/discord-webhook.png)
+
 ### Get report
 
 ``` sh
