@@ -1,20 +1,58 @@
 import argparse
 import os
+import sys
 import time
+from collections import deque
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
+from enum import IntEnum
 from glob import glob
-from typing import Generator, NamedTuple, Optional
+from pathlib import Path
+from typing import Generator, Optional
 
 import requests
+from loguru import logger
 from scapy.layers.inet import ICMP, IP
 from scapy.packet import Packet
 from scapy.plist import PacketList, SndRcvList
 from scapy.sendrecv import sr
 
 
-class Entry(NamedTuple):
+class Status(IntEnum):
+    UP = 0
+    DOWN = 1
+    # Indicate continuation, not up or downtime
+    STARTED = 2
+    # Indicate end of current monitoring, not up or downtime
+    STOPPED = 3
+
+    def __str__(self) -> str:
+        return ["UP", "DOWN", "STARTED", "STOPPED"][self.value]
+
+
+@dataclass
+class LogEntry:
     timestamp: int
-    status: bool
+    status: Status
+
+
+@dataclass
+class UptimeSummary:
+    uptime: timedelta
+    downtime: timedelta
+
+
+@dataclass
+class DiscordEmbed:
+    title: str
+    description: str | None
+    color: int
+
+
+@dataclass
+class DiscordMessage:
+    username: str
+    embeds: list[DiscordEmbed]
 
 
 class DiscordWebhook:
@@ -23,37 +61,62 @@ class DiscordWebhook:
         self.ip: str = ip
         self.session: requests.Session = requests.Session()
 
-    def notify(self, state: bool, delta: timedelta) -> bool:
+    def notify(self, state: Status, delta: timedelta, previous_status: Status) -> bool:
         formatted_delta = format_timedelta(delta)
-        if state:
-            title = f"{self.ip} is REACHABLE"
-            content = f"Was unreachable for {formatted_delta}"
-            color = 0x2ECC71  # green
-        else:
-            title = f"{self.ip} is UNREACHABLE"
-            content = f"Was reachable for {formatted_delta}"
-            color = 0xE74C3C  # red
+        match state:
+            case Status.UP:
+                if previous_status in {Status.STARTED, Status.STOPPED}:
+                    description = f"Was unreachable for {formatted_delta}"
+                else:
+                    description = None
 
-        return self.send(title, content, color)
+                embed = DiscordEmbed(
+                    title=f"{self.ip} is REACHABLE",
+                    description=description,
+                    color=0x2ECC71,  # green
+                )
+            case Status.DOWN:
+                if previous_status in {Status.STARTED, Status.STOPPED}:
+                    description = f"Was reachable for {formatted_delta}"
+                else:
+                    description = None
 
-    def send(self, title: str, content: str, color: int) -> bool:
-        data = {
-            "username": "Network outage monitor",
-            "embeds": [
-                {
-                    "title": title,
-                    "description": content,
-                    "color": color,
-                }
-            ],
-        }
+                embed = DiscordEmbed(
+                    title=f"{self.ip} is UNREACHABLE",
+                    description=description,
+                    color=0xE74C3C,  # red
+                )
+            case Status.STARTED:
+                embed = DiscordEmbed(
+                    title=f"Started monitoring {self.ip}",
+                    description=None,
+                    color=0x0389FA,  # blue
+                )
+            case Status.STOPPED:
+                embed = DiscordEmbed(
+                    title=f"Stopped monitoring {self.ip}",
+                    description=None,
+                    color=0x0389FA,  # blue
+                )
+
+        return self.send(embed)
+
+    def send(self, embed: DiscordEmbed) -> bool:
+        data = DiscordMessage(
+            username="Network Outage Monitor",
+            embeds=[embed],
+        )
 
         try:
-            response = self.session.post(self.url, json=data)
+            response = self.session.post(
+                self.url,
+                json=asdict(data),
+                headers={"Content-Type": "application/json"},
+            )
             response.raise_for_status()
             return response.ok
         except requests.RequestException as e:
-            print(f"Error sending webhook notification: {e}")
+            logger.warning(f"Got error when sending webhook notification: {e}")
             return False
 
 
@@ -76,117 +139,132 @@ def format_timedelta(td: timedelta) -> str:
     return " ".join(parts)
 
 
-def get_last_entry(log_dir: str) -> Optional[Entry]:
-    log_files = sorted(glob(os.path.join(log_dir, "uptime_*.log")))
+def get_last_entries(log_dir: Path, n: int = 1) -> deque[LogEntry]:
+    log_files = sorted(glob(str(log_dir / "uptime_*.log")))
+    queue: deque[LogEntry] = deque(maxlen=n)
+
     if not log_files:
-        return None
+        return queue
 
-    last_entry: Optional[Entry] = None
     for filepath in log_files:
-        for entry in read_entries(filepath):
-            last_entry = entry
-    return last_entry
+        queue.extend(read_entries(filepath))
+
+    return queue
 
 
-def is_up(ip: str) -> bool:
+def try_continue_monitoring(
+    save_dir: Path, webhook: Optional[DiscordWebhook]
+) -> LogEntry:
+    default = LogEntry(int(time.time()), Status.STARTED)
+    entries = get_last_entries(save_dir, n=2)
+
+    # Notify start
+    handle_status_change(
+        save_dir,
+        state=Status.STARTED,
+        # Previous entry is not used for Status.STARTED, so this is just a placeholder
+        previous=LogEntry(0, Status.STOPPED),
+        webhook=webhook,
+    )
+
+    # need at least 1 entry if we want to continue
+    if not entries:
+        return default
+
+    # Last entry SHOULD be Status.STOPPED
+    if entries[-1].status != Status.STOPPED:
+        return default
+
+    # The second last SHOULD be one of Status.UP or Status.DOWN
+    if entries[-2].status not in {Status.STARTED, Status.STOPPED}:
+        return default
+
+    # Print that we continue from the last time we stopped, but set timestamp such
+    # that the total uptime and total downtime calculation doesn't include the time
+    # in between STOPPED and STARTED
+    last_entry = entries[-2]
+    time_of_stop = entries[-1].timestamp
+    time_to_ignore = default.timestamp - time_of_stop
+
+    logger.info(
+        f"Resuming from last entry at {datetime.fromtimestamp(last_entry.timestamp)} "
+        f"({last_entry.status!s})"
+    )
+
+    return LogEntry(last_entry.timestamp + time_to_ignore, last_entry.status)
+
+
+def is_up(ip: str) -> Status:
     pkt: Packet = IP(dst=ip) / ICMP()
 
     ans: SndRcvList
     _unans: PacketList
     ans, _unans = sr(pkt, timeout=2, verbose=0)
-    return bool(ans)
+
+    return Status.UP if ans else Status.DOWN
 
 
-def write_entry(filepath: str, entry: Entry) -> None:
+def write_entry(filepath: Path, entry: LogEntry) -> None:
     """
-    Write a 4-byte packed record:
-    - 31 bits: timestamp
-    - 1 bit: status (1 = up, 0 = down)
+    Write a 5-byte packed record:
+    - 38 bits: timestamp
+    - 2 bits: status
     """
-    if entry.timestamp >= (1 << 31):
-        raise ValueError("Timestamp too large for 31-bit storage")
+    if entry.timestamp >= (1 << 38):
+        raise ValueError("Timestamp too large for 38-bit storage")
 
-    value = (entry.timestamp << 1) | int(entry.status)
-    packed = value.to_bytes(4, byteorder="big")
+    value = (entry.timestamp << 2) | entry.status
+    packed = value.to_bytes(5, byteorder="big")
     with open(filepath, "ab") as f:
         f.write(packed)
 
 
-def read_entries(filepath: str) -> Generator[Entry, None, None]:
+def read_entries(filepath: str) -> Generator[LogEntry, None, None]:
     """
-    Yield (timestamp, status) from the 4-byte packed binary file.
+    Yield (timestamp, status) from the 5-byte packed binary file.
     """
     with open(filepath, "rb") as f:
         while True:
-            chunk: bytes = f.read(4)
-            if len(chunk) < 4:
+            chunk: bytes = f.read(5)
+            if len(chunk) < 5:
                 break
-            value = int.from_bytes(chunk, byteorder="big")
-            timestamp = value >> 1
-            status = bool(value & 1)
-            yield Entry(timestamp, status)
+
+            n = int.from_bytes(chunk, byteorder="big")
+            timestamp = n >> 2
+            status = Status(n & 0b11)
+            yield LogEntry(timestamp, status)
 
 
-def daemon_mode(
-    ip: str, interval: int, save_dir: str, webhook: Optional[DiscordWebhook]
-) -> None:
-    os.makedirs(save_dir, exist_ok=True)
-    print(f"Starting uptime monitor every {interval}s. Saving to directory: {save_dir}")
+def handle_status_change(
+    save_dir: Path, state: Status, previous: LogEntry, webhook: Optional[DiscordWebhook]
+) -> LogEntry:
+    now = int(time.time())
+    month_str = datetime.fromtimestamp(now).strftime("%Y-%m")
 
-    previous_update = int(time.time())
-    previous_state: Optional[bool] = None
+    filename = save_dir / f"uptime_{month_str}.log"
 
-    last_entry = get_last_entry(save_dir)
-    if last_entry:
-        previous_update = last_entry.timestamp
-        previous_state = last_entry.status
-        print(
-            f"Resuming from last entry at {datetime.fromtimestamp(previous_update)} "
-            f"({'UP' if previous_state else 'DOWN'})"
-        )
+    current_entry = LogEntry(now, state)
+    write_entry(filename, current_entry)
 
-    while True:
-        try:
-            time.sleep(interval)
-            now = int(time.time())
-            state = is_up(ip)
+    if webhook is not None:
+        current_time = datetime.fromtimestamp(current_entry.timestamp)
+        previous_time = datetime.fromtimestamp(previous.timestamp)
+        delta = current_time - previous_time
+        webhook.notify(state, delta, previous.status)
 
-            if state != previous_state:
-                month_str = datetime.fromtimestamp(now).strftime("%Y-%m")
-                filename = os.path.join(save_dir, f"uptime_{month_str}.log")
-                current_entry = Entry(now, state)
-                write_entry(filename, current_entry)
-
-                if webhook is not None:
-                    delta = datetime.fromtimestamp(
-                        current_entry.timestamp
-                    ) - datetime.fromtimestamp(previous_update)
-                    webhook.notify(state, delta)
-
-                previous_update = current_entry.timestamp
-                previous_state = current_entry.status
-
-        except KeyboardInterrupt:
-            break
+    return current_entry
 
 
+def print_log_entries(entries: list[LogEntry]) -> None:
+    print(f"| {'Time':<19} | {'Status':<7} |")
+    print(f"|{'-' * 21}|{'-' * 9}|")
 
-def log_mode(load_dir: str) -> None:
-    log_files = sorted(glob(os.path.join(load_dir, "uptime_*.log")))
-    if not log_files:
-        print("No log files found")
-        return
+    for entry in entries:
+        timestr = datetime.fromtimestamp(entry.timestamp).strftime(r"%Y-%m-%d %H:%M:%S")
+        print(f"| {timestr:<19} | {entry.status!s:<7} |")
 
-    entries: list[Entry] = []
 
-    for filepath in log_files:
-        entries.extend(read_entries(filepath))
-
-    if not entries:
-        print("No entries found in log files")
-        return
-
-    entries.sort(key=lambda e: e.timestamp)
+def sum_up_and_downtime(entries: list[LogEntry]) -> UptimeSummary:
     total_uptime = timedelta()
     total_downtime = timedelta()
 
@@ -196,24 +274,83 @@ def log_mode(load_dir: str) -> None:
         current = entries[i]
         delta = timedelta(seconds=current.timestamp - previous.timestamp)
 
-        if previous.status:
-            total_uptime += delta
-        else:
-            total_downtime += delta
+        # If delta is negative, the log is invalid
+        assert delta >= timedelta(seconds=0)
 
-    print(f"Total uptime: {format_timedelta(total_uptime)}")
-    print(f"Total downtime: {format_timedelta(total_downtime)}\n")
+        logger.trace(f"{previous.status!s:<8} -> {current.status!s:<8}: {delta}")
+        match previous.status:
+            case Status.UP:
+                total_uptime += delta
+            case Status.DOWN:
+                total_downtime += delta
+            case _:
+                # Status.STARTED:
+                # Ignore time between STARTED and current entry as the next entry after
+                # STARTED will have happened immediately and contain uptime status
+                #
+                # Status.STOPPED:
+                # Ignore time between STOPPED and current entry as the monitor didn't
+                # run at this time
+                pass
 
-    print(f"| {'Time':<19} | Status |")
-    print(f"|{'-' * 21}|--------|")
-
-    for entry in entries:
-        timestr = datetime.fromtimestamp(entry.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-        statstr = "UP" if entry.status else "DOWN"
-        print(f"| {timestr} | {statstr:<6} |")
+    return UptimeSummary(total_uptime, total_downtime)
 
 
-def main() -> None:
+def daemon_mode(
+    ip: str, interval: int, save_dir: Path, webhook: Optional[DiscordWebhook]
+) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    logger.info(
+        f"Pinging {ip} every {interval}s. Saving status and timestamp to directory: "
+        f"{save_dir}"
+    )
+
+    previous_entry = try_continue_monitoring(save_dir, webhook)
+
+    while True:
+        try:
+            time.sleep(interval)
+            state = is_up(ip)
+
+            if state != previous_entry.status:
+                previous_entry = handle_status_change(
+                    save_dir, state, previous_entry, webhook
+                )
+
+        except KeyboardInterrupt:
+            logger.info("Logging status STOPPED")
+            handle_status_change(save_dir, Status.STOPPED, previous_entry, webhook)
+            break
+
+
+def log_mode(load_dir: Path) -> int:
+    log_files: list[str] = sorted(glob(str(load_dir / "uptime_*.log")))
+    if not log_files:
+        logger.error(f"No log files found in {load_dir}")
+        return 1
+
+    entries: list[LogEntry] = []
+
+    for filepath in log_files:
+        entries.extend(read_entries(filepath))
+
+    if not entries:
+        logger.warning("Found one or more log files, but they were all empty")
+        return 0
+
+    entries.sort(key=lambda e: e.timestamp)
+
+    summary = sum_up_and_downtime(entries)
+    print(f"Total uptime: {format_timedelta(summary.uptime)}")
+    print(f"Total downtime: {format_timedelta(summary.downtime)}")
+    
+    print()
+    print_log_entries(entries)
+
+    return 0
+
+
+def get_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Uptime Monitor")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -223,7 +360,7 @@ def main() -> None:
         "--interval", type=int, default=20, help="Check interval in seconds"
     )
     daemon_parser.add_argument(
-        "--save", type=str, required=True, help="Directory to save logs"
+        "--save", type=Path, required=True, help="Directory to save logs"
     )
     daemon_parser.add_argument("--ip", type=str, required=True, help="IP to monitor")
     daemon_parser.add_argument(
@@ -231,24 +368,71 @@ def main() -> None:
         type=str,
         help="Send up and downtime notifications to a Discord webhook",
     )
+    daemon_parser.add_argument(
+        "--discord-webhook-file",
+        type=Path,
+        help="Send up and downtime notifications to a Discord webhook. Reads webhook "
+        "URL from the specified URL",
+    )
 
     # log subcommand
     log_parser = subparsers.add_parser("log", help="Read and print logs")
     log_parser.add_argument(
-        "--load", type=str, required=True, help="Directory to load logs from"
+        "--load", type=Path, required=True, help="Directory to load logs from"
     )
 
     args = parser.parse_args()
+    return args
+
+
+def instantiate_logger() -> None:
+    logger.remove()
+    logger_format = (
+        "<green>[{time:HH:mm:ss.SSS}]</green> "
+        "<cyan>[{function}</cyan>:<cyan>{line}]</cyan> "
+        "<level>[{level}]</level> "
+        "<level>{message}</level>"
+    )
+    logger.add(sys.stdout, format=logger_format)
+
+
+def main() -> int:
+    instantiate_logger()
+    args = get_cli_args()
 
     if args.command == "daemon":
-        if args.discord_webhook is None:
+        if args.discord_webhook is None and args.discord_webhook_file is None:
             daemon_mode(args.ip, args.interval, args.save, None)
         else:
-            webhook = DiscordWebhook(args.discord_webhook, args.ip)
+            webhook_url: str = args.discord_webhook
+            if args.discord_webhook is None:
+                try:
+                    with open(args.discord_webhook_file, "r") as fd:
+                        webhook_url = fd.read().strip()
+                except FileNotFoundError:
+                    logger.error(
+                        "Couldn't find file containing webhook URL at "
+                        f"{args.discord_webhook_file}"
+                    )
+                    return 1
+                except PermissionError:
+                    logger.error(
+                        "No permission to read file containing webhook URL at "
+                        f"{args.discord_webhoopk_file}"
+                    )
+                    return 1
+                except Exception as e:
+                    logger.exception(e)
+                    return 1
+
+            webhook = DiscordWebhook(webhook_url, args.ip)
             daemon_mode(args.ip, args.interval, args.save, webhook)
+            return 0
     elif args.command == "log":
-        log_mode(args.load)
+        return log_mode(args.load)
+
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
