@@ -372,7 +372,7 @@ def get_cli_args() -> argparse.Namespace:
         "--discord-webhook-file",
         type=Path,
         help="Send up and downtime notifications to a Discord webhook. Reads webhook "
-        "URL from the specified URL",
+        "URL from the specified file",
     )
 
     # log subcommand
